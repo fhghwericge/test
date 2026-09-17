@@ -1,143 +1,131 @@
-import torch
-import torch.nn.functional as F
+# # 信道数据处理：`fulldata.npy`
 
-# ============================================================
-# Gradient Structure Diagnostic
-# 目的：
-# 1. Theta-space：验证不同样本的输出参数梯度存在明显方向分化/冲突
-# 2. Final Head：验证上述冲突传入共享参数空间后转化为近似正交
-# 3. 各网络模块：验证不同样本之间缺乏稳定的跨样本梯度共享
-# ============================================================
+# 数据由 `data_gen.ipynb` 生成（TDL-A，delay_spread=300ns，fc=3.5GHz，速度 5km/h，空间不相关 corr_list=[[0,0,0,0]]）。
 
-def flatten_grads(params):
-    grads = []
-    for p in params:
-        if not p.requires_grad:
-            continue
-        g = torch.zeros(p.numel()) if p.grad is None else p.grad.detach().reshape(-1).float().cpu()
-        grads.append(g)
-    return torch.cat(grads)
+# 原始数组 `[1, 1000, 2, 4, 32, 100, 32]`，dtype complex64，约 6.1 GiB，**必须用 mmap 加载**。已核对 E[|h|²]≈1（normalize=True），无 NaN/Inf。
+
+# | 轴 | 大小 | 含义 |
+# |---|---|---|
+# | 0 | 1 | 配置组合（corr × tdl × delay_spread） |
+# | 1 | 1000 | seed(10) × batch(100) |
+# | 2 | 2 | batch_size |
+# | 3 | 4 | RX 天线（2RX × 双极化） |
+# | 4 | 32 | TX 天线（N1×N2=16 × 双极化） |
+# | 5 | 100 | 时间步（T_sample=0.02s，共 2s） |
+# | 6 | 32 | 子载波（fft_size，子载波间隔 2.88MHz） |
+
+# 处理流程：合并轴 0/1/2/5 得到 N=200000 个样本 → 可视化 → 按 block 80/10/10 划分 → 转为 `[N, TX, 子载波, RX, 2]` 分块写出。
 
 
-def pairwise_stats(G, name):
-    """统计样本两两梯度方向，用于 Theta-space 和 Final Head。"""
-    G = G.float()
-    norms = G.norm(dim=1)
-    valid = norms > 1e-10
-    G = G[valid]
-    G_norm = F.normalize(G, p=2, dim=1)
+import os
+import numpy as np
+import matplotlib.pyplot as plt
 
-    cos_matrix = G_norm @ G_norm.T
-    mask = torch.triu(torch.ones(len(G), len(G), dtype=torch.bool), diagonal=1)
-    pair_cos = cos_matrix[mask]
+fpath = None
+# name = 'TDLA_32T4R_16_1_16RB_30k_300ns_XPL_5km_sionna_L_pred1.npy'
+name = 'fulldata.npy'
+for p in [f"./{name}", f"./Workspace/data/{name}", f"../data/{name}"]:
+    if os.path.exists(p):
+        fpath = p
+        break
+if fpath is None:
+    raise FileNotFoundError("fulldata.npy not found")
 
-    mean_g = G.mean(dim=0)
-    R = mean_g.norm() / (G.norm(dim=1).mean() + 1e-12)
-
-    print(f"\n[{name}]")
-    print(f"  R                         : {R.item():.4f}")
-    print(f"  Mean Pairwise Cosine      : {pair_cos.mean().item():.4f}")
-    print(f"  Strong Conflict (< -0.5)  : {(pair_cos < -0.5).float().mean().item():.2%}")
-    print(f"  Strong Alignment (> 0.5)  : {(pair_cos > 0.5).float().mean().item():.2%}")
-
-
-def cross_sample_stats(G, name):
-    """Leave-One-Out：统计其他样本的平均梯度对当前样本的影响。"""
-    G = G.float()
-    norms = G.norm(dim=1)
-    valid = norms > 1e-10
-    B = G.shape[0]
-
-    mean_g = G.mean(dim=0)
-    R = mean_g.norm() / (norms[valid].mean() + 1e-12)
-
-    G_loo = (G.sum(dim=0, keepdim=True) - G) / (B - 1)
-    loo_norms = G_loo.norm(dim=1)
-    valid = valid & (loo_norms > 1e-10)
-
-    dot = (G * G_loo).sum(dim=1)
-    cosine = dot / (norms * loo_norms + 1e-12)
-
-    print(f"\n[{name}]")
-    print(f"  R                         : {R.item():.4f}")
-    print(f"  LOO Mean Cosine           : {cosine[valid].mean().item():.4f}")
-    print(f"  Cross-Harmed Ratio        : {(dot[valid] < 0).float().mean().item():.2%}")
+h = np.load(fpath, mmap_mode="r")
+print("file  :", os.path.abspath(fpath))
+print("shape :", h.shape)
+print("dtype :", h.dtype)
+print("size  : %.2f GiB" % (h.nbytes / 1024**3))
 
 
-def gradient_structure_diagnostic(model, H_batch, snr_batch, cap_loss, codebook):
-    model.eval()
-    B = H_batch.shape[0]
-    final_layer = model.head.mlp[-1]
 
-    modules = {
-        "Preprocessor": list(model.preprocessor.parameters()),
-        "FiLM": list(model.film_generator.parameters()),
-        "Backbone": list(model.backbone.parameters()),
-        "Head": list(model.head.parameters()),
-        "Final Head": list(final_layer.parameters()),
-    }
+# ## 1. 样本索引
 
-    theta_grads = []
-    module_grads = {name: [] for name in modules}
+# 轴 0/1/2/5 合并为样本量 **N = 1×1000×2×100 = 200000**，逻辑形状 `[N, 子载波, RX, TX] = [200000, 32, 4, 32]`。
 
-    for i in range(B):
-        model.zero_grad(set_to_none=True)
+# 磁盘数组是 C 序，直接 `transpose + reshape` 会把整份 6.1 GiB 复制进内存，因此不物化：`get_sample(i)` 惰性索引（单样本 16 KB）。
 
-        H_i = H_batch[i:i+1]
-        snr_i = snr_batch[i:i+1]
-
-        theta_i = model(H_i, snr=snr_i)
-        theta_i.retain_grad()
-
-        W_i = codebook(theta_i)
-        loss_i = cap_loss(W_i, H_i, theta_i, snr_i)
-        loss_i.backward()
-
-        # 转换到统一的物理相位坐标：
-        # alpha_h/v = 2*pi*theta，alpha_phi = pi/2*theta_phi
-        scale = torch.tensor([1/(2*torch.pi), 1/(2*torch.pi), 2/torch.pi, 1/(2*torch.pi), 1/(2*torch.pi), 2/torch.pi])
-        theta_grads.append(theta_i.grad.detach().reshape(-1).float().cpu() * scale)
-
-        for name, params in modules.items():
-            module_grads[name].append(flatten_grads(params))
-
-    G_theta = torch.stack(theta_grads)
-    G_modules = {name: torch.stack(grads) for name, grads in module_grads.items()}
-
-    print("=" * 64)
-    print(f"Gradient Structure Diagnostic | B={B}")
-    print(f"Orthogonal reference: 1/sqrt(B) = {1 / (B ** 0.5):.4f}")
-    print("=" * 64)
-
-    # --------------------------------------------------------
-    # Part 1：输出参数梯度存在明显方向分化/冲突
-    # --------------------------------------------------------
-    print("\n=== Pairwise Gradient Structure ===")
-    pairwise_stats(G_theta, "Theta-space")
-    pairwise_stats(G_modules["Final Head"], "Final Head")
-
-    # --------------------------------------------------------
-    # Part 2：网络各层跨样本梯度是否存在共享方向
-    # --------------------------------------------------------
-    print("\n=== Cross-Sample Gradient Sharing (Leave-One-Out) ===")
-    for name in ["Preprocessor", "FiLM", "Backbone", "Head", "Final Head"]:
-        cross_sample_stats(G_modules[name], name)
-
-    model.zero_grad(set_to_none=True)
+# 样本序：`i = ((blk×2)+b)×100 + t`，blk∈[0,1000)、b∈[0,2)、t∈[0,100)。
 
 
-# ============================================================
-# Trained Model + Test Set
-# ============================================================
+N_BLK, N_B, N_T = h.shape[1], h.shape[2], h.shape[5] # 1000,2,100
+N_SAMPLE = h.shape[0] * N_BLK * N_B * N_T
+N_SUBC, N_RX, N_TX = h.shape[6], h.shape[3], h.shape[4]
+print("N =", N_SAMPLE, "  per-sample [subc, RX, TX] =", (N_SUBC, N_RX, N_TX))
 
-B = 64
-H_test = torch.stack([test_ds[i][0] for i in range(B)]).to(device)
-snr_test = torch.stack([test_ds[i][1] for i in range(B)]).to(device)
+def get_sample(i):
+    assert 0 <= i < N_SAMPLE
+    blk, b, t = np.unravel_index(i, (N_BLK, N_B, N_T))
+    s = np.asarray(h[0, blk, b, :, :, t, :])
+    return s.transpose(2, 0, 1)
 
-gradient_structure_diagnostic(
-    model=model,
-    H_batch=H_test,
-    snr_batch=snr_test,
-    cap_loss=cap_loss,
-    codebook=codebook
-)
+# ## 2. 训练 / 验证 / 测试划分与保存
+
+# 不在 200000 个样本上随机打乱：同一 block 内 `t` 相邻、同一 seed 下 100 个 batch 连续生成，随机切分会泄漏。在 **block 轴**（1000 = 10 seed × 100 batch）上 80/10/10 划分，再展开成样本下标。
+
+# 写出格式：复数 `[子载波, RX, TX]` → 实数 `[TX, 子载波, RX, 2]`（末轴为实/虚）。按 sorted block 分块写入，避免一次性读入 6.1 GiB。
+
+# 输出：
+# - `train_data.npy` `[160000, 32, 32, 4, 2]`
+# - `val_data.npy` `[20000, 32, 32, 4, 2]`
+# - `test_data.npy` `[20000, 32, 32, 4, 2]`
+# - `train_idx.npy` / `val_idx.npy` / `test_idx.npy`
+
+SPLIT_RATIOS = (0.8, 0.1, 0.1)
+RNG_SEED = 0
+
+rng = np.random.default_rng(RNG_SEED)
+perm = rng.permutation(N_BLK)
+n_train_blk = int(round(N_BLK * SPLIT_RATIOS[0]))
+n_val_blk = int(round(N_BLK * SPLIT_RATIOS[1]))
+train_blk = perm[:n_train_blk]
+val_blk = perm[n_train_blk:n_train_blk + n_val_blk]
+test_blk = perm[n_train_blk + n_val_blk:]
+
+def blocks_to_sample_idx(blks):
+    base = np.asarray(blks)[:, None] * (N_B * N_T)
+    return np.sort((base + np.arange(N_B * N_T)[None, :]).ravel())
+
+train_idx = blocks_to_sample_idx(train_blk)
+val_idx = blocks_to_sample_idx(val_blk)
+test_idx = blocks_to_sample_idx(test_blk)
+print("train:", train_blk.size, "blocks /", train_idx.size, "samples")
+print("val  :", val_blk.size, "blocks /", val_idx.size, "samples")
+print("test :", test_blk.size, "blocks /", test_idx.size, "samples")
+
+outdir = os.path.dirname(os.path.abspath(fpath))
+train_path = os.path.join(outdir, "train_data.npy")
+val_path = os.path.join(outdir, "val_data.npy")
+test_path = os.path.join(outdir, "test_data.npy")
+
+def write_split(path, blks):
+    blks = np.sort(np.asarray(blks))
+    n = blks.size * N_B * N_T
+    shape = (n, N_TX, N_SUBC, N_RX, 2)
+    fp = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=shape)
+    span = N_B * N_T
+    cursor = 0
+    for blk in blks:
+        arr = np.asarray(h[0, int(blk)])
+        arr = np.transpose(arr, (0, 3, 2, 4, 1))  # [N_T, N_SUBC, N_RX, N_TX] complex
+        # ---- 逐样本归一化: 每个样本的 E[|h|^2] = 1 ----
+        # arr 的轴 0 为时间步(样本), 对其余维度求 |h|^2 均值, 再缩放使逐样本功率归一化
+        mean_power = np.mean(np.abs(arr) ** 2, axis=(1, 2, 3))  # (N_T,) 逐样本功率
+        scale = 1.0 / np.sqrt(mean_power)                       # (N_T,) 缩放系数
+        arr = arr * scale[:, None, None, None]
+        # ------------------------------------------------
+        out = np.stack((arr.real, arr.imag), axis=-1).astype(np.float32)
+        fp[cursor:cursor + span] = out.reshape(span, N_TX, N_SUBC, N_RX, 2)
+        cursor += span
+    fp.flush()
+    del fp
+    print("wrote", path, "shape", shape)
+
+write_split(train_path, train_blk)
+write_split(val_path, val_blk)
+write_split(test_path, test_blk)
+np.save(os.path.join(outdir, "train_idx.npy"), train_idx)
+np.save(os.path.join(outdir, "val_idx.npy"), val_idx)
+np.save(os.path.join(outdir, "test_idx.npy"), test_idx)
+
+
