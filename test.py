@@ -1,3 +1,329 @@
+## 代码段1
+
+import torch
+import torch.nn.functional as F
+
+
+# ============================================================
+# Gradient Conflict Diagnostic
+# ============================================================
+
+def gradient_conflict_stats(G, name="grad"):
+    """
+    G: (B, P)
+       B 个样本对应的梯度向量
+    """
+
+    G = G.float()
+
+    grad_norms = G.norm(dim=1)
+
+    # 排除几乎为 0 的梯度：
+    # 对接近局部驻点的训练样本，cosine 本身没有太大意义
+    valid = grad_norms > 1e-10
+    G = G[valid]
+    grad_norms = grad_norms[valid]
+
+    B_valid = G.shape[0]
+
+    if B_valid < 2:
+        print(f"[{name}] 有效梯度不足，无法计算冲突")
+        return
+
+    # --------------------------------------------------------
+    # 1. Cancellation Ratio
+    # --------------------------------------------------------
+
+    mean_grad = G.mean(dim=0)
+
+    norm_mean = mean_grad.norm()
+    mean_norm = grad_norms.mean()
+
+    R = norm_mean / (mean_norm + 1e-12)
+
+    # --------------------------------------------------------
+    # 2. Pairwise cosine similarity
+    # --------------------------------------------------------
+
+    G_norm = F.normalize(G, p=2, dim=1)
+
+    cosine_matrix = G_norm @ G_norm.T
+
+    # 只取上三角，不重复计算，也不要对角线
+    mask = torch.triu(
+        torch.ones(
+            B_valid,
+            B_valid,
+            dtype=torch.bool
+        ),
+        diagonal=1
+    )
+
+    pair_cos = cosine_matrix[mask]
+
+    mean_cos = pair_cos.mean()
+    median_cos = pair_cos.median()
+
+    negative_ratio = (
+        pair_cos < 0
+    ).float().mean()
+
+    strong_negative_ratio = (
+        pair_cos < -0.5
+    ).float().mean()
+
+    positive_ratio = (
+        pair_cos > 0.5
+    ).float().mean()
+
+    print(f"\n[{name}]")
+    print(f"  valid samples       : {B_valid}")
+    print(
+        f"  mean grad norm      : "
+        f"{mean_norm.item():.6f}"
+    )
+    print(
+        f"  ||mean grad||       : "
+        f"{norm_mean.item():.6f}"
+    )
+    print(
+        f"  cancellation R      : "
+        f"{R.item():.4f}"
+    )
+
+    print(
+        f"  mean cosine         : "
+        f"{mean_cos.item():.4f}"
+    )
+    print(
+        f"  median cosine       : "
+        f"{median_cos.item():.4f}"
+    )
+
+    print(
+        f"  cosine < 0 ratio    : "
+        f"{negative_ratio.item():.2%}"
+    )
+    print(
+        f"  cosine < -0.5 ratio : "
+        f"{strong_negative_ratio.item():.2%}"
+    )
+    print(
+        f"  cosine > 0.5 ratio  : "
+        f"{positive_ratio.item():.2%}"
+    )
+
+    return {
+        "R": R.item(),
+        "mean_cos": mean_cos.item(),
+        "median_cos": median_cos.item(),
+        "negative_ratio": negative_ratio.item(),
+        "strong_negative_ratio":
+            strong_negative_ratio.item(),
+        "positive_ratio": positive_ratio.item(),
+        "mean_grad_norm": mean_norm.item(),
+    }
+
+
+def get_grad_vector(parameters):
+    """将一组参数当前的 gradient 拼接成一维向量"""
+
+    grads = []
+
+    for p in parameters:
+        if p.grad is not None:
+            grads.append(
+                p.grad.detach().reshape(-1).cpu()
+            )
+
+    if len(grads) == 0:
+        return None
+
+    return torch.cat(grads)
+
+
+# ============================================================
+# 实验设置
+# ============================================================
+
+B = 64
+
+indices = list(range(B))
+
+H_real = torch.stack(
+    [test_ds[i][0] for i in indices]
+).to(device)
+
+snr_test = torch.stack(
+    [test_ds[i][1] for i in indices]
+).to(device)
+
+
+# IMPORTANT:
+# 使用 eval() 消除 Dropout 等随机性
+# eval() 不会关闭 autograd
+model.eval()
+
+
+theta_grad_list = []
+head_grad_list = []
+
+# 可选：
+# whole_model_grad_list = []
+
+
+target_layer = model.head.mlp[2]
+
+
+# ============================================================
+# Per-sample backward
+# ============================================================
+
+for i in range(B):
+
+    model.zero_grad(set_to_none=True)
+
+    H_i = H_real[i:i+1]
+    snr_i = snr_test[i:i+1]
+
+    theta_i = model(
+        H_i,
+        snr=snr_i
+    )
+
+    # 保留非叶节点 Theta 的梯度
+    theta_i.retain_grad()
+
+    W_i = codebook(theta_i)
+
+    loss_i = cap_loss(
+        W_i,
+        H_i,
+        theta_i,
+        snr_i
+    )
+
+    loss_i.backward()
+
+    # ========================================================
+    # 1. Theta-space gradient
+    # ========================================================
+
+    g_theta = (
+        theta_i.grad
+        .detach()
+        .reshape(-1)
+        .cpu()
+    )
+
+    # --------------------------------------------------------
+    # 由于 phi 范围是 [0,4]，
+    # 而 h/v 是 [0,1]，
+    # 转换成实际相位角坐标后再比较 cosine 更合理：
+    #
+    # alpha_h/v = 2*pi*theta
+    # alpha_phi = pi/2 * theta_phi
+    #
+    # dL/dalpha =
+    # dL/dtheta * dtheta/dalpha
+    # --------------------------------------------------------
+
+    scale = torch.tensor(
+        [
+            1.0 / (2 * torch.pi),
+            1.0 / (2 * torch.pi),
+            2.0 / torch.pi,
+
+            1.0 / (2 * torch.pi),
+            1.0 / (2 * torch.pi),
+            2.0 / torch.pi,
+        ]
+    )
+
+    g_theta_physical = g_theta * scale
+
+    theta_grad_list.append(
+        g_theta_physical
+    )
+
+    # ========================================================
+    # 2. Final-head gradient
+    #
+    # 同时包含 weight + bias
+    # ========================================================
+
+    g_head = torch.cat([
+        target_layer.weight.grad
+            .detach()
+            .reshape(-1)
+            .cpu(),
+
+        target_layer.bias.grad
+            .detach()
+            .reshape(-1)
+            .cpu()
+    ])
+
+    head_grad_list.append(g_head)
+
+    # ========================================================
+    # 3. Optional: whole-model gradient
+    # ========================================================
+
+    # g_model = get_grad_vector(
+    #     model.parameters()
+    # )
+    #
+    # whole_model_grad_list.append(
+    #     g_model
+    # )
+
+
+# ============================================================
+# Stack
+# ============================================================
+
+G_theta = torch.stack(
+    theta_grad_list
+)
+
+G_head = torch.stack(
+    head_grad_list
+)
+
+
+# ============================================================
+# Statistics
+# ============================================================
+
+print("\n" + "=" * 70)
+print("Gradient Conflict Diagnostic")
+print("=" * 70)
+
+stats_theta = gradient_conflict_stats(
+    G_theta,
+    name="Theta-space"
+)
+
+stats_head = gradient_conflict_stats(
+    G_head,
+    name="Final Head"
+)
+
+
+# Optional whole model
+#
+# G_model = torch.stack(
+#     whole_model_grad_list
+# )
+#
+# stats_model = gradient_conflict_stats(
+#     G_model,
+#     name="Whole Model"
+# )
+
+
+## 代码段2
 import torch
 import torch.nn.functional as F
 
@@ -98,6 +424,7 @@ def alignment_statistics(
     g_bar_norm = g_bar.norm()
 
     mean_grad_norm = grad_norms[valid].mean()
+
 
     cancellation_R = (
         g_bar_norm /
@@ -520,3 +847,4 @@ results_test = check_batch_alignment(
     codebook=codebook,
     name="Test"
 )
+
